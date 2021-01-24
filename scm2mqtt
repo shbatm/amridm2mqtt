@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""
+Runs rtlamr to watch for IDM broadcasts from power meter. If meter id
+is in the list, usage is sent to 'readings/{meter id}/meter_reading'
+topic on the MQTT broker specified in settings.
+
+WATCHED_METERS = A Python list indicating those meter IDs to record and post.
+MQTT_HOST = String containing the MQTT server address.
+MQTT_PORT = An int containing the port the MQTT server is active on.
+
+"""
+import os
+import subprocess
+import signal
+import json
+import sys
+import time
+import paho.mqtt.publish as publish
+import settings
+
+# uses signal to shutdown and hard kill opened processes and self
+def shutdown(signum, frame):
+    rtltcp.send_signal(15)
+    rtlamr.send_signal(15)
+    time.sleep(1)
+    rtltcp.send_signal(9)
+    rtlamr.send_signal(9)
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, shutdown)
+signal.signal(signal.SIGINT, shutdown)
+
+# stores last interval id to avoid duplication, includes getter and setter
+last_reading = {}
+
+auth = None
+
+if len(settings.MQTT_USER) and len(settings.MQTT_PASSWORD):
+    auth = {"username": settings.MQTT_USER, "password": settings.MQTT_PASSWORD}
+
+DEBUG = os.environ.get("DEBUG", "").lower() in ["1", "true", "t"]
+
+
+def debug_print(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
+
+
+# send data to MQTT broker defined in settings
+def send_mqtt(topic, payload, retain=False):
+    try:
+        publish.single(
+            topic,
+            payload=json.dumps(payload),
+            qos=1,
+            hostname=settings.MQTT_HOST,
+            port=settings.MQTT_PORT,
+            auth=auth,
+            retain=retain,
+            client_id=settings.MQTT_CLIENT,
+        )
+    except Exception as ex:
+        print("MQTT Publish Failed: " + str(ex))
+
+
+def send_discovery_info():
+    for meter in settings.WATCHED_METERS:
+        name = f"{meter['type']}_meter_{meter['id']}"
+        discovery_payload = {
+            "value_template": "{{ value_json.value }}",
+            "unit_of_measurement": meter["units"],
+            "state_topic": f"{settings.MQTT_TOPIC}/{name}",
+            "icon": "mdi:gauge",
+            "device": {
+                "identifiers": [f"rtlamr_{name}"],
+                "manufacturer": meter["manufacturer"],
+                "model": meter["model"],
+                "name": name,
+                "sw_version": "1.0.0",
+            },
+            "name": name,
+            "unique_id": f"rtlamr_{name}",
+        }
+
+        debug_print(
+            f"Sending Discovery Payload for {meter['id']}:\n{json.dumps(discovery_payload)}"
+        )
+        send_mqtt(
+            f"{settings.HASS_DISCOVERY_TOPIC}/sensor/{name}/config",
+            discovery_payload,
+            retain=True,
+        )
+
+
+# start the rtl_tcp program
+rtltcp = subprocess.Popen(
+    [settings.RTL_TCP + " > /dev/null 2>&1 &"],
+    shell=True,
+    stdin=None,
+    stdout=None,
+    stderr=None,
+    close_fds=True,
+)
+time.sleep(5)
+
+# start the rtlamr program.
+rtlamr_filterid = ""
+if settings.WATCHED_METERS:
+    meter_ids = [m["id"] for m in settings.WATCHED_METERS]
+    rtlamr_filterid = f"-filterid={','.join([str(m) for m in meter_ids])}"
+    debug_print(f"Filtering for Meter IDs {rtlamr_filterid}")
+
+rtlamr_cmd = [
+    settings.RTLAMR,
+    "-format=json",
+    rtlamr_filterid,
+]
+rtlamr = subprocess.Popen(rtlamr_cmd, stdout=subprocess.PIPE, universal_newlines=True)
+
+send_discovery_info()
+
+while True:
+    try:
+        amrline = rtlamr.stdout.readline().strip()
+
+        try:
+            meter_reading = json.loads(amrline)
+        except ValueError as e:
+            debug_print("Invalid JSON Message Received, Skipping")
+            continue
+
+        # Process Meter Reading
+        meter = next(
+            (
+                meter
+                for meter in settings.WATCHED_METERS
+                if meter["id"] == meter_reading["Message"]["ID"]
+            ),
+            None,
+        )
+
+        if not meter:
+            debug_print("No Valid Meter Found")
+            continue
+
+        current_reading = meter["multiplier"] * meter_reading["Message"]["Consumption"]
+        debug_print(f"Sending {meter['type']} meter reading: {current_reading}")
+        send_mqtt(
+            f"{settings.MQTT_TOPIC}/{meter['type']}_meter_{meter['id']}",
+            {"time": meter_reading["Time"], "value": current_reading},
+        )
+
+    except Exception as e:
+        debug_print("Exception squashed! {}: {}", e.__class__.__name__, e)
+        time.sleep(2)

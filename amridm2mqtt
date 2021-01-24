@@ -62,7 +62,7 @@ rtltcp = subprocess.Popen([settings.RTL_TCP + " > /dev/null 2>&1 &"], shell=True
 time.sleep(5)
 
 # start the rtlamr program.
-rtlamr_cmd = [settings.RTLAMR, '-msgtype=idm', '-format=csv']
+rtlamr_cmd = [settings.RTLAMR, '-format=csv']
 rtlamr = subprocess.Popen(rtlamr_cmd, stdout=subprocess.PIPE, universal_newlines=True)
 
 while True:
