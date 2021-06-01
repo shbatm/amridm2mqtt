@@ -71,6 +71,8 @@ def send_discovery_info():
             "value_template": "{{ value_json.value }}",
             "unit_of_measurement": meter["units"],
             "state_topic": f"{settings.MQTT_TOPIC}/{name}",
+            "force_update": True,
+            "expire_after": 3600,
             "icon": "mdi:gauge",
             "device": {
                 "identifiers": [f"rtlamr_{name}"],
